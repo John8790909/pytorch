@@ -11,6 +11,7 @@ COMPACT_JOB_NAME="${BUILD_ENVIRONMENT}"
 CUSTOM_TEST_ARTIFACT_BUILD_DIR=$(realpath "${CUSTOM_TEST_ARTIFACT_BUILD_DIR:-${PWD}/../}")
 
 TORCH_INSTALL_DIR=$(python -c "import site; print(site.getsitepackages()[0])")/torch
+TORCH_BIN_DIR="$TORCH_INSTALL_DIR"/bin
 TORCH_LIB_DIR="$TORCH_INSTALL_DIR"/lib
 TORCH_TEST_DIR="$TORCH_INSTALL_DIR"/test
 
@@ -150,6 +151,10 @@ if [ -n "$IN_PULL_REQUEST" ] && [[ "$BUILD_ENVIRONMENT" != *coverage* ]]; then
   file_diff_from_base "$DETERMINE_FROM"
 fi
 
+if [[ "$BUILD_ENVIRONMENT" == *ppc64le* ]]; then
+  SUDO=sudo
+fi
+
 test_python_legacy_jit() {
   time python test/run_test.py --include test_jit_legacy test_jit_fuser_legacy --verbose --determine-from="$DETERMINE_FROM"
   assert_git_not_dirty
@@ -197,10 +202,6 @@ test_aten() {
     # NB: the ATen test binaries don't have RPATH set, so it's necessary to
     # put the dynamic libraries somewhere were the dynamic linker can find them.
     # This is a bit of a hack.
-    if [[ "$BUILD_ENVIRONMENT" == *ppc64le* ]]; then
-      SUDO=sudo
-    fi
-
     ${SUDO} ln -sf "$TORCH_LIB_DIR"/libc10* "$TEST_BASE_DIR"
     ${SUDO} ln -sf "$TORCH_LIB_DIR"/libcaffe2* "$TEST_BASE_DIR"
     ${SUDO} ln -sf "$TORCH_LIB_DIR"/libmkldnn* "$TEST_BASE_DIR"
@@ -242,7 +243,21 @@ fi
 
 test_libtorch() {
   if [[ "$BUILD_ENVIRONMENT" != *rocm* ]]; then
-    echo "Testing libtorch"
+    if [[ -n "$IN_WHEEL_TEST" ]]; then
+      echo "Testing libtorch with the install folder"
+      # Rename the build folder when running test to ensure it
+      # is not depended on the folder
+      mv "$BUILD_DIR" "$BUILD_RENAMED_DIR"
+      TEST_BASE_DIR="$TORCH_BIN_DIR"
+      ${SUDO} ln -sf "$TORCH_LIB_DIR"/libjitbackend_test.so "$TEST_BASE_DIR"
+      ${SUDO} ln -sf "$TORCH_LIB_DIR"/libtorch_cpu.so "$TEST_BASE_DIR"
+      ${SUDO} ln -sf "$TORCH_LIB_DIR"/libtorch.so "$TEST_BASE_DIR"
+      ${SUDO} ln -sf "$TORCH_LIB_DIR"/libc10.so "$TEST_BASE_DIR"
+      ${SUDO} ln -sf "$TORCH_LIB_DIR"/libbackend_with_compiler.so "$TEST_BASE_DIR"
+    else
+      echo "Testing libtorch with the build folder"
+      TEST_BASE_DIR="$BUILD_BIN_DIR"
+    fi
 
     # Start background download
     python tools/download_mnist.py --quiet -d test/cpp/api/mnist &
@@ -256,16 +271,22 @@ test_libtorch() {
     # Run JIT cpp tests
     python test/cpp/jit/tests_setup.py setup
     if [[ "$BUILD_ENVIRONMENT" == *cuda* ]]; then
-      build/bin/test_jit  --gtest_output=xml:$TEST_REPORTS_DIR/test_jit.xml
+      "$TEST_BASE_DIR"/test_jit  --gtest_output=xml:$TEST_REPORTS_DIR/test_jit.xml
     else
-      build/bin/test_jit  --gtest_filter='-*CUDA' --gtest_output=xml:$TEST_REPORTS_DIR/test_jit.xml
+      "$TEST_BASE_DIR"/test_jit  --gtest_filter='-*CUDA' --gtest_output=xml:$TEST_REPORTS_DIR/test_jit.xml
     fi
     python test/cpp/jit/tests_setup.py shutdown
     # Wait for background download to finish
     wait
-    OMP_NUM_THREADS=2 TORCH_CPP_TEST_MNIST_PATH="test/cpp/api/mnist" build/bin/test_api --gtest_output=xml:$TEST_REPORTS_DIR/test_api.xml
-    build/bin/test_tensorexpr --gtest_output=xml:$TEST_REPORTS_DIR/test_tensorexpr.xml
-    build/bin/test_mobile_nnc --gtest_output=xml:$TEST_REPORTS_DIR/test_mobile_nnc.xml
+    OMP_NUM_THREADS=2 TORCH_CPP_TEST_MNIST_PATH="test/cpp/api/mnist" "$TEST_BASE_DIR"/test_api --gtest_output=xml:$TEST_REPORTS_DIR/test_api.xml
+    "$TEST_BASE_DIR"/test_tensorexpr --gtest_output=xml:$TEST_REPORTS_DIR/test_tensorexpr.xml
+    "$TEST_BASE_DIR"/test_mobile_nnc --gtest_output=xml:$TEST_REPORTS_DIR/test_mobile_nnc.xml
+
+    if [[ -n "$IN_WHEEL_TEST" ]]; then
+      # Restore the build folder to avoid any impact on other tests
+      mv "$BUILD_RENAMED_DIR" "$BUILD_DIR"
+    fi
+
     assert_git_not_dirty
   fi
 }
